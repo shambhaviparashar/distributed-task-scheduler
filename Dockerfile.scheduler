@@ -1,0 +1,67 @@
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+# Install git and build-essential
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Set working directory
+WORKDIR /app
+
+# Copy go.mod and go.sum files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy the entire source code
+COPY . .
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-w -s" -o scheduler ./cmd/scheduler
+
+# Final stage
+FROM alpine:3.18
+
+# Install ca-certificates for HTTPS connections and tzdata for timezone support
+RUN apk --no-cache add ca-certificates tzdata wget
+
+# Set working directory
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /app/scheduler .
+
+# Default environment settings - can be overridden at runtime
+ENV LOG_LEVEL=info \
+    DB_HOST=postgres \
+    DB_PORT=5432 \
+    DB_USER=taskuser \
+    DB_PASSWORD=password \
+    DB_NAME=taskdb \
+    DB_SSLMODE=disable \
+    REDIS_ADDR=redis:6379 \
+    REDIS_PASSWORD= \
+    REDIS_DB=0
+
+# Create a simple HTTP health check endpoint
+COPY --from=builder /app/scripts/health-check.sh /app/health-check.sh
+RUN chmod +x /app/health-check.sh
+
+# Expose metrics port
+EXPOSE 9090
+
+# Add health check - uses a custom script that checks if the scheduler process is running
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD /app/health-check.sh || exit 1
+
+# Set resource limits (metadata only)
+LABEL org.opencontainers.image.vendor="Your Organization" \
+      org.opencontainers.image.title="Task Scheduler Service" \
+      org.opencontainers.image.description="Scheduler service for the distributed task scheduler" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.authors="youremail@example.com" \
+      com.yourdomain.memory-limit="256Mi" \
+      com.yourdomain.cpu-limit="250m"
+
+# Run the scheduler service
+CMD ["./scheduler"] 

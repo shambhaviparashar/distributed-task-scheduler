@@ -1,0 +1,71 @@
+# Build stage
+FROM golang:1.21-alpine AS builder
+
+# Install git and build-essential
+RUN apk add --no-cache git ca-certificates tzdata
+
+# Set working directory
+WORKDIR /app
+
+# Copy go.mod and go.sum files
+COPY go.mod go.sum ./
+
+# Download dependencies
+RUN go mod download
+
+# Copy the entire source code
+COPY . .
+
+# Build the application
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -ldflags="-w -s" -o apiserver ./cmd/api
+
+# Final stage
+FROM alpine:3.18
+
+# Install ca-certificates for HTTPS connections and tzdata for timezone support
+RUN apk --no-cache add ca-certificates tzdata
+
+# Set working directory
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /app/apiserver .
+
+# Copy migrations directory for database schema
+COPY --from=builder /app/migrations ./migrations
+
+# Default environment settings - can be overridden at runtime
+ENV API_PORT=8080 \
+    METRICS_PORT=9090 \
+    LOG_LEVEL=info \
+    DB_HOST=postgres \
+    DB_PORT=5432 \
+    DB_USER=taskuser \
+    DB_PASSWORD=password \
+    DB_NAME=taskdb \
+    DB_SSLMODE=disable \
+    REDIS_ADDR=redis:6379 \
+    REDIS_PASSWORD= \
+    REDIS_DB=0 \
+    WORKER_COUNT=5
+
+# Expose API and metrics ports
+EXPOSE 8080 9090
+
+# Add health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD wget -q --spider http://localhost:8080/health/live || exit 1
+
+# Set resource limits
+# Note: Docker doesn't enforce these limits, they're just metadata
+# For actual resource limits, use Kubernetes resource limits or Docker run --memory and --cpus
+LABEL org.opencontainers.image.vendor="Your Organization" \
+      org.opencontainers.image.title="Task Scheduler API Server" \
+      org.opencontainers.image.description="API server for the distributed task scheduler" \
+      org.opencontainers.image.version="1.0.0" \
+      org.opencontainers.image.authors="youremail@example.com" \
+      com.yourdomain.memory-limit="512Mi" \
+      com.yourdomain.cpu-limit="500m"
+
+# Run the API server
+CMD ["./apiserver"] 

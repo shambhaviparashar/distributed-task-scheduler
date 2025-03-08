@@ -1,0 +1,284 @@
+name: Task Scheduler CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+env:
+  REGISTRY: ghcr.io
+  API_SERVER_IMAGE: ${{ github.repository }}/api-server
+  SCHEDULER_IMAGE: ${{ github.repository }}/scheduler
+  WORKER_IMAGE: ${{ github.repository }}/worker
+  POSTGRES_PASSWORD: test-password
+  REDIS_PASSWORD: test-password
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          POSTGRES_USER: taskuser
+          POSTGRES_DB: taskdb_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '^1.21'
+      
+      - name: Install dependencies
+        run: go mod download
+      
+      - name: Run unit tests
+        run: go test -v -race ./... -coverprofile=coverage.out
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USER: taskuser
+          DB_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+          DB_NAME: taskdb_test
+          DB_SSLMODE: disable
+          REDIS_ADDR: localhost:6379
+      
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v3
+        with:
+          name: coverage-report
+          path: coverage.out
+  
+  lint:
+    name: Code Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '^1.21'
+      
+      - name: Install golangci-lint
+        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.53.3
+      
+      - name: Run golangci-lint
+        run: golangci-lint run --timeout 5m
+  
+  build:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [test, lint]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build and push API server image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.API_SERVER_IMAGE }}:latest,${{ env.REGISTRY }}/${{ env.API_SERVER_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.API_SERVER_IMAGE }}:latest
+          cache-to: type=inline
+      
+      - name: Build and push Scheduler image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.scheduler
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.SCHEDULER_IMAGE }}:latest,${{ env.REGISTRY }}/${{ env.SCHEDULER_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.SCHEDULER_IMAGE }}:latest
+          cache-to: type=inline
+      
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}:latest,${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}:${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}:latest
+          cache-to: type=inline
+  
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+      
+      - name: Update Kubernetes manifests
+        run: |
+          # Set the correct image tags in Kubernetes manifests
+          sed -i 's|${REGISTRY_HOST}/task-scheduler/api-server:latest|${{ env.REGISTRY }}/${{ env.API_SERVER_IMAGE }}:${{ github.sha }}|g' kubernetes/api-server.yaml
+          sed -i 's|${REGISTRY_HOST}/task-scheduler/scheduler:latest|${{ env.REGISTRY }}/${{ env.SCHEDULER_IMAGE }}:${{ github.sha }}|g' kubernetes/scheduler.yaml
+          sed -i 's|${REGISTRY_HOST}/task-scheduler/worker:latest|${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}:${{ github.sha }}|g' kubernetes/worker.yaml
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Create namespace if it doesn't exist
+          kubectl apply -f kubernetes/namespace.yaml
+          
+          # Apply ConfigMap and Secrets
+          kubectl apply -f kubernetes/configmap.yaml
+          
+          # Create secrets (for staging, we'll create them directly)
+          kubectl create secret generic db-credentials \
+            --namespace=task-scheduler \
+            --from-literal=DB_USER=taskuser \
+            --from-literal=DB_PASSWORD=${{ secrets.DB_PASSWORD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          kubectl create secret generic redis-credentials \
+            --namespace=task-scheduler \
+            --from-literal=REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy database and redis
+          kubectl apply -f kubernetes/postgres.yaml
+          kubectl apply -f kubernetes/redis.yaml
+          
+          # Wait for database and redis to be ready
+          kubectl wait --for=condition=ready pod -l app=postgres --timeout=120s -n task-scheduler
+          kubectl wait --for=condition=ready pod -l app=redis --timeout=120s -n task-scheduler
+          
+          # Deploy application components
+          kubectl apply -f kubernetes/api-server.yaml
+          kubectl apply -f kubernetes/scheduler.yaml
+          kubectl apply -f kubernetes/worker.yaml
+          
+          # Apply network policies
+          kubectl apply -f kubernetes/network-policies.yaml
+          
+          # Apply ingress
+          kubectl apply -f kubernetes/ingress.yaml
+          
+          # Deploy monitoring
+          kubectl apply -f kubernetes/monitoring.yaml
+  
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://tasks-api.example.com
+    
+    steps:
+      - name: Manual approval
+        run: echo "This step requires manual approval in the GitHub UI"
+      
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+      
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBE_CONFIG_PROD }}" > $HOME/.kube/config
+          chmod 600 $HOME/.kube/config
+      
+      - name: Update Kubernetes manifests
+        run: |
+          # Set the correct image tags in Kubernetes manifests
+          sed -i 's|${REGISTRY_HOST}/task-scheduler/api-server:latest|${{ env.REGISTRY }}/${{ env.API_SERVER_IMAGE }}:${{ github.sha }}|g' kubernetes/api-server.yaml
+          sed -i 's|${REGISTRY_HOST}/task-scheduler/scheduler:latest|${{ env.REGISTRY }}/${{ env.SCHEDULER_IMAGE }}:${{ github.sha }}|g' kubernetes/scheduler.yaml
+          sed -i 's|${REGISTRY_HOST}/task-scheduler/worker:latest|${{ env.REGISTRY }}/${{ env.WORKER_IMAGE }}:${{ github.sha }}|g' kubernetes/worker.yaml
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Create namespace if it doesn't exist
+          kubectl apply -f kubernetes/namespace.yaml
+          
+          # Apply ConfigMap and Secrets
+          kubectl apply -f kubernetes/configmap.yaml
+          
+          # Create secrets (use production secrets)
+          kubectl create secret generic db-credentials \
+            --namespace=task-scheduler \
+            --from-literal=DB_USER=taskuser \
+            --from-literal=DB_PASSWORD=${{ secrets.DB_PASSWORD_PROD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          kubectl create secret generic redis-credentials \
+            --namespace=task-scheduler \
+            --from-literal=REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD_PROD }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Deploy application components with canary strategy
+          kubectl apply -f kubernetes/api-server.yaml
+          kubectl apply -f kubernetes/scheduler.yaml
+          kubectl apply -f kubernetes/worker.yaml
+          
+          # Apply network policies
+          kubectl apply -f kubernetes/network-policies.yaml
+          
+          # Apply ingress
+          kubectl apply -f kubernetes/ingress.yaml
+          
+          # Deploy monitoring
+          kubectl apply -f kubernetes/monitoring.yaml 
